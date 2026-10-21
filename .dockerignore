@@ -1,0 +1,8 @@
+.git
+.env
+.cache
+.gopath
+.gocache
+training/artifacts
+**/__pycache__
+**/.venv
