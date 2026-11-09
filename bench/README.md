@@ -1,71 +1,59 @@
 # 基准测试（bench）
 
-压的是**网关本身**，不是模型。所以上游换成 mock：固定 0ms 处理延迟、固定响应体，
-这样测出来的 req/s 和 P95 才是网关的转发、鉴权、限流、缓存逻辑本身的成本。
+压的是**网关本身**，不是模型。上游换成 mock（固定响应、0ms 处理），压测客户端与 mock 都在
+`bench/` 下用 Go 写、只依赖标准库，所以不需要装任何第三方压测工具，也不会因为工具版本不同测出不同结果。
 
-> 结论只写进 `docs/benchmark.md`，并且必须能由本页命令复现。
+> 结论只写进 `docs/benchmark.md`，且必须能由本页命令复现。
 
-## 0. 前提
-
-- Go 1.23+（`go version`）
-- Python 3.8+（只用标准库）
-- `ghz`：`go install github.com/bojand/ghz/cmd/ghz@latest`
-
-## 1. 起 mock 上游
+## 一键跑
 
 ```powershell
-python bench/mock_upstream.py
-# mock upstream listening on http://127.0.0.1:9999/v1
+powershell -ExecutionPolicy Bypass -File bench/run.ps1
+# 或指定档位与时长
+powershell -ExecutionPolicy Bypass -File bench/run.ps1 -Duration 60s -Concurrency "10,50,200"
 ```
 
-## 2. 起网关，指向 mock
+脚本会依次：编译 `cmd/server`、`cmd/token`、`bench/mockupstream`、`bench/loadgen` →
+起 mock（:9999）→ 起网关（:8080）→ 等 `/healthz` 就绪 → 签 JWT → 逐档压测 → 停掉两个进程。
 
-**关键三点**，漏一个测出来的就不是网关性能：
+原始输出落在 `bin/bench-logs/`，汇总同时打印成表格。
+
+## 三个必须注意的环境变量
 
 | 变量 | 值 | 为什么 |
-|---|---|---|
-| `REDIS_ADDR` | 留空 | 关缓存，测纯代理链路（要测缓存另跑一轮） |
-| `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST` | 1000000 | 默认 20/40，不关掉测的是限流器 |
-| `LLM_PROVIDERS` | `mock=http://127.0.0.1:9999/v1\|sk-mock\|mock-model` | 指向 mock |
+| --- | --- | --- |
+| `REDIS_ADDR` | 留空 | 关缓存，测纯代理链路（要测缓存命中另跑一轮） |
+| `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST` | 1000000 | 默认 20 / 40，不关掉测的是限流器 |
+| `LLM_PROVIDERS` | `mock=http://127.0.0.1:9999/v1\|sk-mock\|mock-model` | 指向 mock，不指向真模型 |
+
+`run.ps1` 已经替你设好这三项。手动跑的话必须自己设。
+
+## 手动跑（分三个终端）
 
 ```powershell
-$env:JWT_SECRET            = "bench-secret"
-$env:LLM_PROVIDERS         = "mock=http://127.0.0.1:9999/v1|sk-mock|mock-model"
-$env:REDIS_ADDR            = ""
-$env:RATE_LIMIT_RPS        = "1000000"
-$env:RATE_LIMIT_BURST      = "1000000"
+# 终端 1
+go run ./bench/mockupstream -addr 127.0.0.1:9999
+
+# 终端 2
+$env:JWT_SECRET="bench-secret"
+$env:LLM_PROVIDERS="mock=http://127.0.0.1:9999/v1|sk-mock|mock-model"
+$env:REDIS_ADDR=""
+$env:RATE_LIMIT_RPS="1000000"
+$env:RATE_LIMIT_BURST="1000000"
 go run ./cmd/server
-```
 
-## 3. 生成 token
-
-```powershell
-$env:JWT_SECRET = "bench-secret"
+# 终端 3
 $token = go run ./cmd/token -sub bench -tenant bench -secret bench-secret
+go run ./bench/loadgen -c 50 -z 30s -token $token `
+  -url "http://127.0.0.1:8080/v1/chat/completions"
 ```
 
-## 4. 压非流式
+`loadgen` 输出一行人读的汇总，外加一行 `RESULT {...}` JSON，方便脚本解析。
 
-```powershell
-ghz -z 60s -c 50 -m POST `
-  -H "Content-Type: application/json" `
-  -H "Authorization: Bearer $token" `
-  -d '{"model":"mock-model","messages":[{"role":"user","content":"hello"}]}' `
-  http://127.0.0.1:8080/v1/chat/completions
-```
+## 已知的测量边界
 
-并发至少跑三档（10 / 50 / 200），每档记录：
-
-- `Requests/s`
-- `Average` / `P95` / `P99` 延迟
-- 错误率（`Error distribution`）
-
-## 5. 压流式（可选）
-
-把 body 里的 `stream` 改成 `true`，ghz 会读到首字节就结束计时不明显，
-这种场景建议改用首字延迟（TTFT）单独测，或用 `wrk` 记录 `time_starttransfer`。
-
-## 6. 记录
-
-把机型、Go 版本、三档并发的数字填进 `docs/benchmark.md`。
-**没有跑过的格子留空**，不要估算。
+- 本机 loopback 压测，**客户端、网关、mock 在同一台机器上抢 CPU**，并发越高越明显；
+  数字用于横向比较不同版本，不能当作线上容量。
+- 只测非流式。流式要用首字延迟（TTFT）单独衡量，`loadgen` 目前计的是完整响应时间。
+- 缓存关闭。想测命中率，另起一轮并设置 `REDIS_ADDR`，从 `redis-cli info stats` 取
+  `keyspace_hits` / `keyspace_misses`。

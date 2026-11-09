@@ -56,7 +56,19 @@ func New(providers []Provider, opts Options) *Gateway {
 	if opts.MaxAttempts <= 0 {
 		opts.MaxAttempts = 2
 	}
-	return &Gateway{providers: providers, opts: opts, client: &http.Client{Timeout: opts.Timeout}, cacheTTL: 24 * time.Hour}
+	// http.DefaultTransport keeps only 2 idle connections per host. For a
+	// concurrent proxy that means a dial storm: every in-flight request opens a
+	// new TCP connection, and on Windows each dial/close parks a thread, so a
+	// sustained run eventually hits "program exceeds 10000-thread limit" and
+	// dies. Bounding both the idle pool and the total per-host connections keeps
+	// thread count flat. Reproduced with bench/run.ps1 before this change.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 128
+	transport.MaxIdleConnsPerHost = 64
+	transport.MaxConnsPerHost = 64
+	transport.IdleConnTimeout = 90 * time.Second
+
+	return &Gateway{providers: providers, opts: opts, client: &http.Client{Timeout: opts.Timeout, Transport: transport}, cacheTTL: 24 * time.Hour}
 }
 
 func (g *Gateway) SetCache(store cache.Store, ttl time.Duration) {
